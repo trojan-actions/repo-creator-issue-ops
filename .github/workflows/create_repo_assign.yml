@@ -1,0 +1,41 @@
+name: Create Repo - Assign
+on:
+  issues:
+    types:
+      - opened
+env:
+  LGTM_TEAM: lgtm-reviewers
+jobs:
+  assign:
+    name: Assign new issue
+    runs-on: ubuntu-20.04
+    if: contains(github.event.issue.labels.*.name, 'create_repo') && github.event.action == 'opened'
+    steps:
+      - name: Generate app installation token
+        id: github-app-token
+        uses: microsoftgraph/get-app-token@v1.0.0
+        with:
+          application-id: ${{ secrets.APP_ID }}
+          application-private-key: ${{ secrets.APP_PEM }}
+
+      - name: Acknowledge
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ steps.github-app-token.outputs.app-token }}
+          script: |
+            const body = `
+            @${context.actor} : Hey!  Let's get this issue assigned to someone from the @${context.repo.owner}/${process.env.LGTM_TEAM} team while we validate the request.
+            `
+
+            github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: context.issue.number,
+              body
+            })
+
+      - name: Auto-assign issue
+        uses: pozil/auto-assign-issue@v1.4.0
+        with:
+          repo-token: ${{ steps.github-app-token.outputs.app-token }}
+          teams: ${{ env.LGTM_TEAM }}
+          numOfAssignee: 1

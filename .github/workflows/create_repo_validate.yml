@@ -1,0 +1,106 @@
+name: Create Repo - Validate
+on:
+  issues:
+    types:
+      - opened
+      - edited
+env:
+  LGTM_TEAM: lgtm
+jobs:
+  validate-input:
+    name: Validate issue form input
+    runs-on: ubuntu-20.04
+    if: contains(github.event.issue.labels.*.name, 'create_repo') && github.event.issue.state == 'open'
+    outputs:
+      repository-owner: ${{ steps.inputs.outputs.repository-owner }}
+      repository-name: ${{ steps.inputs.outputs.repository-name }}
+      repository-description: ${{ steps.inputs.outputs.repository-description }}
+      repository-visibility: ${{ steps.inputs.outputs.repository-visibility }}
+      repository-access: ${{ steps.inputs.outputs.repository-access }}
+    steps:
+      - name: Cloning repository for reusable scripts
+        uses: actions/checkout@v2
+
+      - name: Generate app installation token
+        id: github-app-token
+        uses: microsoftgraph/get-app-token@v1.0.0
+        with:
+          application-id: ${{ secrets.APP_ID }}
+          application-private-key: ${{ secrets.APP_PEM }}
+
+      - name: Parse issue form
+        id: parse
+        uses: zentered/issue-forms-body-parser@v1.3.0
+
+      - name: Record issue form results
+        uses: actions/github-script@v6
+        env:
+          ISSUE_FORM_JSON: ${{ steps.parse.outputs.data }}
+        with:
+          script: |
+            const issueForm = JSON.parse(process.env.ISSUE_FORM_JSON)
+            const jsonPretty = JSON.stringify(issueForm, null, 2)
+
+            const body = `
+            Nice!  Let's validate the issue form so we can get this thing done!
+
+            <details>
+              <summary>Issue Form Payload</summary>
+
+              \`\`\`json
+              ${jsonPretty}
+              \`\`\`
+            </details>
+            `
+
+            github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: context.issue.number,
+              body
+            })
+
+      - name: Verify issue form results
+        id: inputs
+        uses: actions/github-script@v6
+        env:
+          ISSUE_FORM_JSON: ${{ steps.parse.outputs.data }}
+        with:
+          github-token: ${{ steps.github-app-token.outputs.app-token }}
+          script: |
+            const validate = require('./src/create_repo/validate.js')
+            await validate({github, context, core})
+
+      - name: Handle verify issue form results failure
+        if: ${{ failure() }}
+        uses: actions/github-script@v6
+        env:
+          ERRORS: ${{ steps.inputs.outputs.errors }}
+        with:
+          script: |
+            const errors = JSON.parse(process.env.ERRORS)
+            const errorsPretty = errors.map(error => `1. ${error}`).join("\r\n")
+            const body = `
+            @${context.actor} : Unfortunately, it appears one or more validation issues arose or something went wrong.
+
+            ${errorsPretty}
+            `
+
+            github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: context.issue.number,
+              body
+            })
+
+      - name: Confirm issue form validity
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const body = `
+            @${context.actor} : Everything looks good on the surface!  You've done the hard part, so let's get a \`/lgtm\` comment from someone on the @${context.repo.owner}/${process.env.LGTM_TEAM} team to get this repository created.
+            `
+
+            github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: context.issue.number,
+              body
+            })

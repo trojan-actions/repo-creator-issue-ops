@@ -1,0 +1,369 @@
+name: Create Repo - Fulfill
+on:
+  issue_comment:
+    types:
+      - created
+env:
+  LGTM_TEAM: lgtm
+jobs:
+  verify-approver:
+    name: Verify approver
+    runs-on: ubuntu-20.04
+    if: github.event_name == 'issue_comment' && contains(github.event.issue.labels.*.name, 'create_repo_multi_org') && startsWith(github.event.comment.body, '/lgtm') && github.event.issue.state == 'open'
+    steps:
+      # TODO: Include information about the workflow run because issue view doesn't really include that
+      - name: Acknowledge
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const jsonPretty = JSON.stringify(context.payload, null, 2)
+            const body = `
+            @${context.actor} : Sounds good!  Let me process a few details so this is knocked out immediately.
+
+            <details>
+              <summary>GitHub Event Payload</summary>
+
+              \`\`\`json
+              ${jsonPretty}
+              \`\`\`
+            </details>
+            `
+
+            github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: context.issue.number,
+              body
+            })
+
+      - name: Handle generate app installation token failure
+        if: ${{ failure() }}
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const body = `
+            @${context.actor} : Unfortunately, it appears something went wrong in generating app installation token granting.
+            `
+
+            github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: context.issue.number,
+              body
+            })
+
+      - name: Lookup approver
+        id: lookup-approver
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.MULTI_ORG_TOKEN }}
+          script: |
+            return await github.rest.teams.getMembershipForUserInOrg({
+              org: context.repo.owner,
+              team_slug: process.env.LGTM_TEAM,
+              username: context.actor,
+            })
+
+      - name: Verify lookup approver results
+        uses: actions/github-script@v6
+        env:
+          LOOKUP_APPROVER_JSON: ${{ steps.lookup-approver.outputs.result }}
+        with:
+          script: |
+            const response = JSON.parse(process.env.LOOKUP_APPROVER_JSON)
+            const jsonPretty = JSON.stringify(response, null, 2)
+
+            const body = `
+            @${context.actor} : Verifying whether you're authorized to approve these requests.
+
+            <details>
+              <summary>Lookup Approver Response</summary>
+
+              \`\`\`json
+              ${jsonPretty}
+              \`\`\`
+            </details>
+            `
+
+            github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: context.issue.number,
+              body
+            })
+
+            if (response.status != 200) {
+              core.setFailed(`${context.actor} is either not authorized to approve request or something went wrong.`)
+            }
+
+      - name: Handle lookup approver failure
+        if: ${{ failure() }}
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const body = `
+            @${context.actor} : Unfortunately, it appears you are not not authorized to approve requests or something went wrong.
+            `
+
+            github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: context.issue.number,
+              body
+            })
+
+  validate-input:
+    name: Validate issue form input
+    runs-on: ubuntu-20.04
+    needs:
+      - verify-approver
+    outputs:
+      repository-owner: ${{ steps.inputs.outputs.repository-owner }}
+      repository-name: ${{ steps.inputs.outputs.repository-name }}
+      repository-description: ${{ steps.inputs.outputs.repository-description }}
+      repository-visibility: ${{ steps.inputs.outputs.repository-visibility }}
+      repository-access: ${{ steps.inputs.outputs.repository-access }}
+    steps:
+      - name: Cloning repository for reusable scripts
+        uses: actions/checkout@v2
+
+      - name: Parse issue form
+        id: parse
+        uses: zentered/issue-forms-body-parser@v1.3.0
+
+      - name: Record issue form results
+        uses: actions/github-script@v6
+        env:
+          ISSUE_FORM_JSON: ${{ steps.parse.outputs.data }}
+        with:
+          script: |
+            const issueForm = JSON.parse(process.env.ISSUE_FORM_JSON)
+            const jsonPretty = JSON.stringify(issueForm, null, 2)
+
+            const body = `
+            Nice!  Let's process the issue form and get this thing done!
+
+            <details>
+              <summary>Issue Form Payload</summary>
+
+              \`\`\`json
+              ${jsonPretty}
+              \`\`\`
+            </details>
+            `
+
+            github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: context.issue.number,
+              body
+            })
+
+      - name: Verify issue form results
+        id: inputs
+        uses: actions/github-script@v6
+        env:
+          ISSUE_FORM_JSON: ${{ steps.parse.outputs.data }}
+        with:
+          github-token: ${{ secrets.MULTI_ORG_TOKEN }}
+          script: |
+            const validate = require('./src/create_repo_multi_org/validate.js')
+            await validate({github, context, core})
+
+      - name: Handle verify issue form results failure
+        if: ${{ failure() }}
+        uses: actions/github-script@v6
+        env:
+          ERRORS: ${{ steps.inputs.outputs.errors }}
+        with:
+          script: |
+            const errors = JSON.parse(process.env.ERRORS)
+            const errorsPretty = errors.map(error => `1. ${error}`).join("\r\n")
+            const body = `
+            @${context.actor} : Unfortunately, it appears one or more validation issues arose or something went wrong.
+
+            ${errorsPretty}
+            `
+
+            github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: context.issue.number,
+              body
+            })
+
+  create-repo:
+    name: Create repository
+    runs-on: ubuntu-20.04
+    needs:
+      - validate-input
+    steps:
+      - name: Create repository
+        id: create-repo
+        uses: actions/github-script@v6
+        env:
+          REPOSITORY_OWNER: ${{ needs.validate-input.outputs.repository-owner }}
+          REPOSITORY_NAME: ${{ needs.validate-input.outputs.repository-name }}
+          REPOSITORY_DESCRIPTION: ${{ needs.validate-input.outputs.repository-description }}
+          REPOSITORY_VISIBILITY: ${{ needs.validate-input.outputs.repository-visibility }}
+        with:
+          github-token: ${{ secrets.MULTI_ORG_TOKEN }}
+          script: |
+            return await github.rest.repos.createInOrg({
+              org: process.env.REPOSITORY_OWNER,
+              name: process.env.REPOSITORY_NAME,
+              description: process.env.REPOSITORY_DESCRIPTION,
+              visibility: process.env.REPOSITORY_VISIBILITY,
+              auto_init: true,
+            })
+
+      - name: Verify create repository results
+        uses: actions/github-script@v6
+        env:
+          ISSUE_AUTHOR: ${{ github.event.issue.user.login }}
+          CREATE_REPO_JSON: ${{ steps.create-repo.outputs.result }}
+        with:
+          script: |
+            const response = JSON.parse(process.env.CREATE_REPO_JSON)
+            const jsonPretty = JSON.stringify(response, null, 2)
+            let message;
+
+            if (response.status == 201) {
+              message = `@${process.env.ISSUE_AUTHOR} : Your repository has been created: ${response.data.html_url}`
+            } else {
+              message = `@${context.actor} : Workflow is either not authorized to create repository or something went wrong.`
+              core.setFailed(message)
+            }
+
+            const body = `
+            **${message}**
+
+            <details>
+              <summary>Create Organization Repository Response</summary>
+
+              \`\`\`json
+              ${jsonPretty}
+              \`\`\`
+            </details>
+            `
+
+            github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: context.issue.number,
+              body
+            })
+
+  grant-access:
+    name: Grant repository access
+    runs-on: ubuntu-20.04
+    needs:
+      - validate-input
+      - create-repo
+    steps:
+      - name: Grant repository access
+        id: repo-access
+        uses: actions/github-script@v6
+        env:
+          REPOSITORY_OWNER: ${{ needs.validate-input.outputs.repository-owner }}
+          REPOSITORY_NAME: ${{ needs.validate-input.outputs.repository-name }}
+          REPOSITORY_ACCESS: ${{ needs.validate-input.outputs.repository-access }}
+        with:
+          github-token: ${{ secrets.MULTI_ORG_TOKEN }}
+          script: |
+            const owner = process.env.REPOSITORY_OWNER
+            const repo = process.env.REPOSITORY_NAME
+            const items = decodeURIComponent(process.env.REPOSITORY_ACCESS).split('\n')
+            const team_owner_regex = /@(.*)\/(.*)/
+            const assignments = []
+            const reserved_permissions = ['read', 'pull', 'write', 'push', 'triage', 'maintain', 'admin']
+
+            for (const item of items) {
+              let org = owner
+              let [team_slug, permission] = item.split(',').map(str => str.trim())
+              const team_owner_match = team_owner_regex.exec(team_slug)
+
+              // Account for possibility of team owner being different from repository organization
+              if (team_owner_match) {
+                org = team_owner_match[1]
+                team_slug = team_owner_match[2]
+              }
+
+              // Handle mixed case for reserved permissions
+              const reserved_permission = permission.toLowerCase()
+
+              if (reserved_permissions.includes(reserved_permission)) {
+                permission = reserved_permission
+              }
+
+              // Remap between permission difference between UI and API
+              if (permission == 'read') {
+                permission = 'pull'
+              } else if (permission == 'write') {
+                permission = 'push'
+              }
+
+              const data = {
+                org: org,
+                team_slug: team_slug,
+                owner: owner,
+                repo: repo,
+                permission: permission,
+              }
+
+              try {
+                console.log(`Processing repository access to "${data.owner}/${data.repo}" for "${data.org}/${data.team_slug}" team with "${data.permission}" permission`)
+                await github.rest.teams.addOrUpdateRepoPermissionsInOrg(data)
+                assignments.push(data)
+              } catch (error) {
+                if (error.status !== 404) {
+                  core.setFailed(`${data.owner}/${data.repo} could not grant ${data.permission} access to ${data.org}/${data.team_slug}; please follow up on issue and close issue.`)
+                  throw error
+                }
+              }
+            }
+
+            return assignments
+
+      - name: Handle grant repository access failure
+        if: ${{ failure() }}
+        uses: actions/github-script@v6
+        env:
+          REPOSITORY_OWNER: ${{ needs.validate-input.outputs.repository-owner }}
+          REPOSITORY_NAME: ${{ needs.validate-input.outputs.repository-name }}
+        with:
+          script: |
+            const body = `
+            @${context.actor} : Unfortunately, it appears something went wrong in granting access to ${process.env.REPOSITORY_OWNER}/${process.env.REPOSITORY_NAME}.
+            `
+
+            github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: context.issue.number,
+              body
+            })
+
+      - name: Verify grant repository access results
+        uses: actions/github-script@v6
+        env:
+          ISSUE_AUTHOR: ${{ github.event.issue.user.login }}
+          ASSIGNMENTS_JSON: ${{ steps.repo-access.outputs.result }}
+        with:
+          github-token: ${{ secrets.MULTI_ORG_TOKEN }}
+          script: |
+            const assignments = JSON.parse(process.env.ASSIGNMENTS_JSON)
+            const assignmentsPretty = assignments.map(assignment => `1. @${assignment.org}/${assignment.team_slug}: ${assignment.permission}`).join("\r\n")
+            const body = `
+            **@${process.env.ISSUE_AUTHOR} : The following teams have been granted access to your repository:**
+
+            ${assignmentsPretty}
+            `
+
+            github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: context.issue.number,
+              body
+            })
+
+      - name: Close issue
+        uses: actions/github-script@v6
+        with:
+          script: |
+            github.rest.issues.update({
+              ...context.repo,
+              issue_number: context.issue.number,
+              state: "closed",
+            })
